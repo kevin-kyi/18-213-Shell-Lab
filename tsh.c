@@ -144,6 +144,7 @@ int main(int argc, char **argv) {
         if (feof(stdin)) {
             // End of file (Ctrl-D)
             printf("\n");
+
             return 0;
         }
 
@@ -160,6 +161,189 @@ int main(int argc, char **argv) {
     return -1; // control never reaches here
 }
 
+void unix_error(char *msg) {
+    fprintf(stderr, "%s: %s\n", msg, strerror(errno));
+    exit(0);
+}
+
+pid_t Fork(void) {
+    pid_t pid;
+    if ((pid = fork()) < 0)
+        unix_error("Fork error \n");
+    return pid;
+}
+
+int Open(char *pathname, int flags, mode_t mode) {
+    int fd;
+    if ((fd = open(pathname, flags, mode)) < 0) {
+        if (errno == ENOENT) {
+            sio_printf("%s: No such file or directory\n", pathname);
+        } else if (errno == EACCES) {
+            sio_printf("%s: Permission denied\n", pathname);
+        } else {
+            sio_printf("%s: Could not open file\n", pathname);
+        }
+        return -1;
+    }
+    return fd;
+}
+
+void Close(int fd) {
+    if ((close(fd)) < 0) {
+        sio_printf("%s: Unable to close file or directory\n", strerror(errno));
+        exit(0);
+    }
+}
+
+void continue_job(jid_t jid, job_state state, sigset_t prev) {
+    pid_t pid = job_get_pid(jid);
+
+    // forward the SIGCONT signal to process group PID
+    kill(-pid, SIGCONT);
+    job_set_state(jid, state);
+
+    // case 1: foreground job
+    if (state == FG) {
+        while (fg_job()) {
+            sigsuspend(&prev);
+        }
+    }
+    // case 2: background job
+    else {
+        sio_printf("[%d] (%d) %s\n", jid, pid, job_get_cmdline(jid));
+    }
+    return;
+}
+
+void bgfg_handler(struct cmdline_tokens *token, job_state state) {
+
+    // get the string format of the job state passed in
+    const char *str_state;
+
+    if (state == FG) {
+        str_state = "fg";
+    } else {
+        str_state = "bg";
+    }
+
+    // PID and JID NULL check
+    char *id = token->argv[1];
+    if (id == NULL) {
+        sio_printf("%s command requires PID or %%jobid argument\n", str_state);
+        return;
+    }
+
+    // set up signal masks, jid, and pid
+    sigset_t mask, prev;
+    sigfillset(&mask);
+
+    jid_t jid = 0;
+    pid_t pid = 0;
+
+    // block signals
+    sigprocmask(SIG_BLOCK, &mask, &prev);
+
+    // case 1: valid argument -- parse JID and PID
+    if (id[0] == '%') {
+
+        // search by jid
+        jid = atoi(&(id[1]));
+
+        // check if the job exists
+        if (!job_exists(jid)) {
+            sio_printf("%s: No such job\n", id);
+            sigprocmask(SIG_SETMASK, &prev, NULL);
+            return;
+        } else {
+            // if the job exists, call continue_job to forward SIGCONT signal
+            continue_job(jid, state, prev);
+        }
+    } else if (isdigit(id[0])) {
+        // search by PID
+        pid = atoi(&(id[0]));
+
+        // get corresponding JID
+        jid = job_from_pid(pid);
+
+        // check if the job exists
+        if (!job_exists(jid)) {
+            sio_printf("%s: No such job\n", id);
+            sigprocmask(SIG_SETMASK, &prev, NULL);
+            return;
+        } else {
+            // if the job exists, call continue_job to forward SIGCONT signal
+            continue_job(jid, state, prev);
+        }
+    }
+    // case 2: invalid argument
+    else {
+        sio_printf("%s: argument must be a PID or %%jobid\n", str_state);
+    }
+
+    // unblock signals
+    sigprocmask(SIG_SETMASK, &prev, NULL);
+    return;
+}
+
+/**
+ * @brief This helper function handles the execution of builtin commands using
+ * case/switch statements. This function is only called in eval.
+ * @param[in] token The command line token
+ * @return 1 if the parsed command is a builtin command, 0 if otherwise
+ * Errors are handled with the wrappers Open and Close.
+ * referenced CSAPP textbook page 781, figure 8.24
+ */
+int builtin_cmd(struct cmdline_tokens *token) {
+
+    // set up signal masks
+    sigset_t mask, prev;
+    sigfillset(&mask);
+
+    switch (token->builtin) {
+
+    // case 1: not a builtin command
+    case BUILTIN_NONE:
+        return 0;
+
+    // case 2: quit
+    case BUILTIN_QUIT:
+        exit(0);
+        return 1;
+
+    // case 3: jobs command
+    case BUILTIN_JOBS:
+        sigprocmask(SIG_BLOCK, &mask, &prev);
+
+        // outfile NULL check
+        if (token->outfile) {
+
+            // call Open with parameters for STDOUT file
+            int fd = Open(token->outfile, (O_WRONLY | O_CREAT | O_TRUNC),
+                          (S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH));
+            if (fd > 0) {
+                list_jobs(fd);
+                Close(fd);
+            }
+        } else {
+            list_jobs(STDOUT_FILENO);
+        }
+        sigprocmask(SIG_SETMASK, &prev, NULL);
+        return 1;
+
+    // case 4: fg command
+    case BUILTIN_FG:
+        bgfg_handler(token, FG);
+        return 1;
+
+    // case 5: bg command
+    case BUILTIN_BG:
+        bgfg_handler(token, BG);
+        return 1;
+    default:
+        return 1;
+    }
+}
+
 /**
  * @brief <What does eval do?>
  *
@@ -172,7 +356,7 @@ int main(int argc, char **argv) {
 void eval(const char *cmdline) {
     parseline_return parse_result;
     struct cmdline_tokens token;
-
+    pid_t pid;
     // Parse command line
     parse_result = parseline(cmdline, &token);
 
@@ -181,6 +365,70 @@ void eval(const char *cmdline) {
     }
 
     // TODO: Implement commands here.
+
+    if (!builtin_cmd(&token)) {
+
+        sigset_t mask, prevMask;
+        jid_t jobId;
+        sigfillset(&mask);
+        sigprocmask(SIG_BLOCK, &mask, &prevMask);
+
+        if ((pid = Fork()) == 0) {
+
+            sigprocmask(SIG_SETMASK, &prevMask, NULL);
+            setpgid(0, 0);
+            int fd;
+
+            // input file
+            if (token.infile) {
+                fd = Open(token.infile, O_RDONLY, 0);
+
+                if (fd < 0) {
+                    exit(0);
+                }
+
+                dup2(fd, STDIN_FILENO);
+                Close(fd);
+            }
+
+            // output file
+            if (token.outfile) {
+                fd = Open(token.outfile, (O_WRONLY | O_CREAT | O_TRUNC),
+                          (S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH));
+
+                if (fd < 0) {
+                    exit(0);
+                }
+
+                dup2(fd, STDOUT_FILENO);
+                Close(fd);
+            }
+
+            if (execve(token.argv[0], token.argv, environ) < 0) {
+
+                printf("%s: Command Not Found. \n", token.argv[0]);
+                exit(0);
+            }
+        }
+
+        if ((parse_result == PARSELINE_FG)) {
+
+            jobId = add_job(pid, FG, cmdline);
+
+            while (fg_job() == jobId) {
+                sigsuspend(&prevMask);
+            }
+        }
+
+        if ((parse_result == PARSELINE_BG)) {
+
+            jobId = add_job(pid, BG, cmdline);
+            sio_printf("[%d] (%d) %s \n", jobId, pid, cmdline);
+        }
+
+        sigprocmask(SIG_SETMASK, &prevMask, NULL);
+    }
+    return;
 }
 
 /*****************
@@ -192,7 +440,51 @@ void eval(const char *cmdline) {
  *
  * TODO: Delete this comment and replace it with your own.
  */
-void sigchld_handler(int sig) {}
+void sigchld_handler(int sig) {
+    // set up signal masks
+    sigset_t mask, prev;
+    sigfillset(&mask);
+
+    // save errno
+    int old_errno = errno;
+    int status;
+    pid_t pid;
+
+    // temporarily block signals to protect shared data
+    sigprocmask(SIG_BLOCK, &mask, &prev);
+
+    // handler loops until there are no more stopped/terminated children in the
+    // waitset
+    while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
+
+        jid_t job = job_from_pid(pid);
+
+        // case 1: child process terminated normally
+        if (WIFEXITED(status)) {
+            delete_job(job);
+        }
+
+        // case 2: child process terminated due to uncaught signal
+        else if (WIFSIGNALED(status)) {
+            sio_printf("Job [%d] (%d) terminated by signal %d\n", job, pid,
+                       WTERMSIG(status));
+            delete_job(job);
+        }
+        // case 3: child process stopped by signal
+        else if (WIFSTOPPED(status)) {
+            sio_printf("Job [%d] (%d) stopped by signal %d\n", job, pid,
+                       WSTOPSIG(status));
+            job_set_state(job, ST);
+        }
+    }
+
+    // unblock signal
+    sigprocmask(SIG_SETMASK, &prev, NULL);
+
+    // restore errno
+    errno = old_errno;
+    return;
+}
 
 /**
  * @brief <What does sigint_handler do?>
