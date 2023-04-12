@@ -147,7 +147,7 @@ int main(int argc, char **argv) {
             return 0;
         }
 
-        //Remove any trailing newline
+        // Remove any trailing newline
         char *newline = strchr(cmdline, '\n');
         if (newline != NULL) {
             *newline = '\0';
@@ -160,17 +160,15 @@ int main(int argc, char **argv) {
     return -1; // control never reaches here
 }
 
-
-
-
-void unix_error(char *msg){
+void unix_error(char *msg) {
     fprintf(stderr, "%s: %s\n", msg, strerror(errno));
     exit(0);
 }
 
-pid_t Fork(void){
+pid_t Fork(void) {
     pid_t pid = fork();
-    if(pid < 0) unix_error("Fork error \n");
+    if (pid < 0)
+        unix_error("Fork error \n");
     return pid;
 }
 
@@ -196,47 +194,44 @@ void Close(int fd) {
     }
 }
 
-
-
-
-void bgfg_handler(struct cmdline_tokens *token, job_state state) {
+void bgfg_handler(struct cmdline_tokens *token, job_state state, sigset_t mask,
+                  sigset_t prevMask) {
     char *id = token->argv[1];
 
-    if (state == FG && id == NULL){
-        sio_printf("FG command requires PID or %%jobid argument\n");
+    if (state == FG && id == NULL) {
+        sio_printf("fg command requires PID or %%jobid argument\n");
         return;
     }
-    if (state == BG && id == NULL){
-        sio_printf("BG command requires PID or %%jobid argument\n");
+    if (state == BG && id == NULL) {
+        sio_printf("bg command requires PID or %%jobid argument\n");
         return;
     }
 
     // set up signal masks, jid, and pid
-    sigset_t mask, prevMask;
     jid_t jid = 0;
     pid_t pid = 0;
     sigfillset(&mask);
-
 
     // block signals
     sigprocmask(SIG_BLOCK, &mask, &prevMask);
 
     // case 1: valid argument -- argument passed is a JID
-    if (id[0] == '%') { 
+    if (id[0] == '%') {
         sscanf(&id[1], "%d", &jid);
-    } 
+    }
     // case 2: valid argument -- argument passed is a PID
-    if (isdigit(id[0])) { 
+    if (isdigit(id[0])) {
         sscanf(&id[0], "%d", &pid);
         jid = job_from_pid(pid);
     }
 
-    //checking the validity of the jid from the jid obtained from arguments passed
-    if (jid != 0){
+    // checking the validity of the jid from the jid obtained from arguments
+    // passed
+    if (jid != 0) {
         // check if the job exists
         if (job_exists(jid)) {
-            
-            kill(-pid, SIGCONT);
+
+            kill(-(job_get_pid(jid)), SIGCONT);
             job_set_state(jid, state);
             // case 1: foreground job
             if (state == FG) {
@@ -245,8 +240,9 @@ void bgfg_handler(struct cmdline_tokens *token, job_state state) {
                 }
             }
             // case 2: background job
-            else sio_printf("[%d] (%d) %s\n", jid, pid, job_get_cmdline(jid));
-            
+            else
+                sio_printf("[%d] (%d) %s\n", jid, pid, job_get_cmdline(jid));
+
         } else {
             sio_printf("%s: No such job\n", id);
             sigprocmask(SIG_SETMASK, &prevMask, NULL);
@@ -255,27 +251,26 @@ void bgfg_handler(struct cmdline_tokens *token, job_state state) {
     }
     // case 3: invalid argument
     else {
-        if (state == FG) sio_printf("FG: argument must be a PID or %%jobid\n");
-        else sio_printf("BG: argument must be a PID or %%jobid\n");
+        if (state == FG)
+            sio_printf("fg: argument must be a PID or %%jobid\n");
+        else
+            sio_printf("bg: argument must be a PID or %%jobid\n");
     }
     sigprocmask(SIG_SETMASK, &prevMask, NULL);
     return;
 }
 
-
-
-
-int case_job(struct cmdline_tokens *token, sigset_t mask, sigset_t prevMask)
-{
-    int fd;
+int job_handler(struct cmdline_tokens *token, sigset_t mask,
+                sigset_t prevMask) {
+    // int fd;
     sigprocmask(SIG_BLOCK, &mask, &prevMask);
 
     // outfile NULL check
     if (token->outfile) {
 
-        //open with STDOUT params(from reci notes)
-        fd = Open(token->outfile, (O_WRONLY | O_CREAT | O_TRUNC),
-                        (S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH));
+        // open with STDOUT params(from reci notes)
+        int fd = Open(token->outfile, (O_WRONLY | O_CREAT | O_TRUNC),
+                      (S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH));
         if (fd > 0) {
             list_jobs(fd);
             Close(fd);
@@ -283,66 +278,76 @@ int case_job(struct cmdline_tokens *token, sigset_t mask, sigset_t prevMask)
     } else {
         list_jobs(STDOUT_FILENO);
     }
+
+    // list_jobs(STDOUT_FILENO);
+
     sigprocmask(SIG_SETMASK, &prevMask, NULL);
     return 1;
 }
 
-
-
-int cmd_check(struct cmdline_tokens *token) {
-    //init signal masks
-    sigset_t mask, prev;
-    sigfillset(&mask);
-    builtin_state currState = token->builtin;
-    // case 1: invalid command
-    if (currState == BUILTIN_NONE) return 0;
-
-    // case 2: quit command
-    else if (currState == BUILTIN_QUIT) exit(0);
-
-    // case 3: jobs command
-    else if (currState == BUILTIN_JOBS) case_job(token, mask, prev);
-     
-    // case 4: fg command
-    else if (currState == BUILTIN_FG) bgfg_handler(token, FG);
-
-    // case 5: bg command
-    else if (currState == BUILTIN_BG) bgfg_handler(token, BG);
-    
-    return 1;
-}
-
-
-int cProcess_handler(struct cmdline_tokens token, sigset_t mask, sigset_t prevMask){
-    //restores state saved in prevMask
+int cProcess_handler(struct cmdline_tokens token, sigset_t mask,
+                     sigset_t prevMask) {
+    // restores state saved in prevMask
     sigprocmask(SIG_SETMASK, &prevMask, NULL);
     setpgid(0, 0);
     int fd = 2;
 
     // command associated w/ input file
-    if (token.infile) fd = Open(token.infile, O_RDONLY, 0);
-
+    if (token.infile)
+        fd = Open(token.infile, O_RDONLY, 0);
 
     // command associated w/ output file
-    if (token.outfile) fd = Open(token.outfile, (O_WRONLY | O_CREAT | O_TRUNC),
-                                (S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH));
+    if (token.outfile)
+        fd = Open(token.outfile, (O_WRONLY | O_CREAT | O_TRUNC),
+                  (S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH));
 
-    //checking that file was valid and didn't raise errors
-    if (fd < 0) return 0;
-    //if (fd == -2) no file associated w/ command
-    if (fd != 2){
-        dup2(fd, token.infile ? STDIN_FILENO:STDOUT_FILENO);
+    // checking that file was valid and didn't raise errors
+    if (fd < 0)
+        return 0;
+    // if (fd == -2) no file associated w/ command
+    if (fd != 2) {
+        dup2(fd, token.infile ? STDIN_FILENO : STDOUT_FILENO);
         Close(fd);
     }
 
-    if (execve(token.argv[0], token.argv, environ) < 0){
-        printf("%s: Command Not Found. \n", token.argv[0]);
+    if (execve(token.argv[0], token.argv, environ) < 0) {
+        // sio_printf("%s: Command Not Found. \n", token.argv[0]);
+        if (errno == EACCES)
+            sio_printf("%s: Permission denied\n", token.argv[0]);
+        else
+            sio_printf("%s: No such file or directory\n", token.argv[0]);
         return 0;
     }
     return 1;
 }
 
+int none_handler(struct cmdline_tokens token, parseline_return parse_result,
+                 const char *cmdline, sigset_t mask, sigset_t prevMask,
+                 pid_t pid) {
+    jid_t jobId;
+    sigfillset(&mask);
+    sigprocmask(SIG_BLOCK, &mask, &prevMask);
 
+    // if pid == 0 after a fork then currprocess is a child
+    if ((pid = Fork()) == 0) {
+        if (cProcess_handler(token, mask, prevMask) == 0)
+            return 0;
+    }
+
+    if ((parse_result == PARSELINE_FG)) {
+        jobId = add_job(pid, FG, cmdline);
+        while (fg_job() == jobId) {
+            sigsuspend(&prevMask);
+        }
+    }
+
+    if ((parse_result == PARSELINE_BG)) {
+        jobId = add_job(pid, BG, cmdline);
+        sio_printf("[%d] (%d) %s \n", jobId, pid, cmdline);
+    }
+    sigprocmask(SIG_SETMASK, &prevMask, NULL);
+    return 1;
+}
 
 /**
  * @brief <What does eval do?>
@@ -356,51 +361,46 @@ int cProcess_handler(struct cmdline_tokens token, sigset_t mask, sigset_t prevMa
 void eval(const char *cmdline) {
     parseline_return parse_result;
     struct cmdline_tokens token;
-    pid_t pid;
+    pid_t pid = 0;
     // Parse command line
     parse_result = parseline(cmdline, &token);
-
 
     if (parse_result == PARSELINE_ERROR || parse_result == PARSELINE_EMPTY) {
         return;
     }
 
     // TODO: Implement commands here.
-    if (!cmd_check(&token)){
+    sigset_t mask, prevMask;
+    sigfillset(&mask);
+    builtin_state currState = (&token)->builtin;
 
-        sigset_t mask, prevMask;
-        jid_t jobId;
-        sigfillset(&mask);
-        sigprocmask(SIG_BLOCK, &mask, &prevMask);
-
-        //if pid == 0 after a fork then currprocess is a child
-        if ((pid = Fork()) == 0){
-            if (cProcess_handler(token, mask, prevMask) == 0) exit(0);
-        }
-        
-        if ((parse_result == PARSELINE_FG)){
-            jobId = add_job(pid, FG, cmdline);
-            while (fg_job() == jobId) {
-                sigsuspend(&prevMask);
-            }
-        }
-
-        if ((parse_result == PARSELINE_BG)){
-            jobId = add_job(pid, BG, cmdline);
-            sio_printf("[%d] (%d) %s \n", jobId, pid, cmdline);
-        }      
-
-        sigprocmask(SIG_SETMASK, &prevMask, NULL);  
-
+    if (currState == BUILTIN_QUIT)
+        exit(0);
+    if (currState == BUILTIN_NONE) {
+        if (none_handler(token, parse_result, cmdline, mask, prevMask, pid) ==
+            0)
+            exit(0);
     }
+    if (currState == BUILTIN_JOBS)
+        job_handler(&token, mask, prevMask);
+    if (currState == BUILTIN_FG)
+        bgfg_handler(&token, FG, mask, prevMask);
+    if (currState == BUILTIN_BG)
+        bgfg_handler(&token, BG, mask, prevMask);
+
     return;
 }
-
-
 
 /*****************
  * Signal handlers
  *****************/
+static void Kill(jid_t jid, int signal) {
+    pid_t pid;
+    if ((pid = kill(jid, signal)) < 0) {
+        sio_printf("Kill error");
+        exit(1);
+    }
+}
 
 /**
  * @brief <What does sigchld_handler do?>
@@ -451,7 +451,6 @@ void sigchld_handler(int sig) {
     // restore errno
     errno = old_errno;
     return;
-
 }
 
 /**
@@ -460,8 +459,20 @@ void sigchld_handler(int sig) {
  * TODO: Delete this comment and replace it with your own.
  */
 void sigint_handler(int sig) {
+    sigset_t mask, prev_mask;
+    jid_t jid;
+    sigfillset(&mask);
 
+    int olderrno = errno;
+    sigprocmask(SIG_BLOCK, &mask, &prev_mask);
 
+    if ((jid = fg_job()) != 0) {
+        Kill(-job_get_pid(jid), SIGINT);
+    }
+
+    sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+    errno = olderrno;
+    return;
 }
 
 /**
@@ -469,7 +480,22 @@ void sigint_handler(int sig) {
  *
  * TODO: Delete this comment and replace it with your own.
  */
-void sigtstp_handler(int sig) {}
+void sigtstp_handler(int sig) {
+    sigset_t mask, prev_mask;
+    jid_t jid;
+    sigfillset(&mask);
+
+    int olderrno = errno;
+    sigprocmask(SIG_BLOCK, &mask, &prev_mask);
+
+    if ((jid = fg_job()) != 0) {
+        Kill(-job_get_pid(jid), SIGTSTP);
+    }
+
+    sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+    errno = olderrno;
+    return;
+}
 
 /**
  * @brief Attempt to clean up global resources when the program exits.
@@ -485,7 +511,3 @@ void cleanup(void) {
 
     destroy_job_list();
 }
-
-
-
-
